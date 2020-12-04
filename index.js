@@ -18,6 +18,7 @@ var defaultCacheControl = staticValue(null)
 var defaultContentDisposition = staticValue(null)
 var defaultContentEncoding = staticValue(null)
 var defaultTagging = staticValue(null)
+var defaultObjectLockRetainUntilDate = staticValue(null)
 var defaultStorageClass = staticValue('STANDARD')
 var defaultSSE = staticValue(null)
 var defaultSSEKMS = staticValue(null)
@@ -62,7 +63,8 @@ function collect (storage, req, file, cb) {
     storage.getSSE.bind(storage, req, file),
     storage.getSSEKMS.bind(storage, req, file),
     storage.getContentEncoding.bind(storage, req, file),
-    storage.getTagging.bind(storage, req, file)
+    storage.getTagging.bind(storage, req, file),
+    storage.getObjectLockRetainUntilDate.bind(storage, req, file)
   ], function (err, values) {
     if (err) return cb(err)
 
@@ -82,7 +84,8 @@ function collect (storage, req, file, cb) {
         serverSideEncryption: values[7],
         sseKmsKeyId: values[8],
         contentEncoding: values[9],
-        tagging: values[10]
+        tagging: values[10],
+        objectLockRetainUntilDate: values[11]
       })
     })
   })
@@ -153,6 +156,13 @@ function S3Storage (opts) {
     case 'undefined': this.getTagging = defaultTagging; break
     default: throw new TypeError('Expected opts.tagging to be undefined, string or function')
   }
+  
+  switch (typeof opts.objectLockRetainUntilDate) {
+    case 'function': this.getObjectLockRetainUntilDate = opts.objectLockRetainUntilDate; break
+    case 'object': this.getObjectLockRetainUntilDate = staticValue(opts.objectLockRetainUntilDate); break
+    case 'undefined': this.getObjectLockRetainUntilDate = defaultObjectLockRetainUntilDate; break
+    default: throw new TypeError('Expected opts.objectLockRetainUntilDate to be undefined, string or function')
+  }
 
   switch (typeof opts.storageClass) {
     case 'function': this.getStorageClass = opts.storageClass; break
@@ -206,6 +216,10 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
     if (opts.tagging) {
       params.Tagging = opts.tagging
     }
+    
+    if (opts.objectLockRetainUntilDate) {
+      params.ObjectLockRetainUntilDate = opts.objectLockRetainUntilDate
+    }
 
     var upload = this.s3.upload(params)
 
@@ -225,6 +239,7 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         contentDisposition: opts.contentDisposition,
         contentEncoding: opts.contentEncoding,
         tagging: opts.tagging,
+        objectLockRetainUntilDate: opts.objectLockRetainUntilDate,
         storageClass: opts.storageClass,        
         serverSideEncryption: opts.serverSideEncryption,
         metadata: opts.metadata,
