@@ -221,9 +221,10 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       });
     } catch (e) {
       cb(e);
+      return;
     }
     
-    upload.done().then(function (result) {
+    upload.done().catch(cb).then(function (result) {
       cb(null, {
         size: currentSize,
         bucket: opts.bucket,
@@ -240,7 +241,7 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         etag: result.ETag,
         versionId: result.VersionId
       })
-    }).catch(cb);
+    });
 
   });
 }
