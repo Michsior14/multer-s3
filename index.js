@@ -224,7 +224,7 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       return;
     }
     
-    upload.done().catch(cb).then(function (result) {
+    upload.done().then(function (result) {
       cb(null, {
         size: currentSize,
         bucket: opts.bucket,
@@ -241,7 +241,7 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         etag: result.ETag,
         versionId: result.VersionId
       })
-    });
+    }, cb);
 
   });
 }
