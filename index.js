@@ -3,8 +3,9 @@ var stream = require('stream')
 var fileType = require('file-type')
 var isSvg = require('is-svg')
 var parallel = require('run-parallel')
+var Upload = require('@aws-sdk/lib-storage').Upload;
 
-function staticValue (value) {
+function staticValue(value) {
   return function (req, file, cb) {
     cb(null, value)
   }
@@ -16,17 +17,19 @@ var defaultContentType = staticValue('application/octet-stream')
 var defaultMetadata = staticValue(null)
 var defaultCacheControl = staticValue(null)
 var defaultContentDisposition = staticValue(null)
+var defaultContentEncoding = staticValue(null)
+var defaultTagging = staticValue(null)
 var defaultStorageClass = staticValue('STANDARD')
 var defaultSSE = staticValue(null)
 var defaultSSEKMS = staticValue(null)
 
-function defaultKey (req, file, cb) {
+function defaultKey(req, file, cb) {
   crypto.randomBytes(16, function (err, raw) {
     cb(err, err ? undefined : raw.toString('hex'))
   })
 }
 
-function autoContentType (req, file, cb) {
+function autoContentType(req, file, cb) {
   file.stream.once('data', function (firstChunk) {
     var type = fileType(firstChunk)
     var mime
@@ -48,7 +51,7 @@ function autoContentType (req, file, cb) {
   })
 }
 
-function collect (storage, req, file, cb) {
+function collect(storage, req, file, cb) {
   parallel([
     storage.getBucket.bind(storage, req, file),
     storage.getKey.bind(storage, req, file),
@@ -58,7 +61,9 @@ function collect (storage, req, file, cb) {
     storage.getContentDisposition.bind(storage, req, file),
     storage.getStorageClass.bind(storage, req, file),
     storage.getSSE.bind(storage, req, file),
-    storage.getSSEKMS.bind(storage, req, file)
+    storage.getSSEKMS.bind(storage, req, file),
+    storage.getContentEncoding.bind(storage, req, file),
+    storage.getTagging.bind(storage, req, file)
   ], function (err, values) {
     if (err) return cb(err)
 
@@ -76,13 +81,15 @@ function collect (storage, req, file, cb) {
         contentType: contentType,
         replacementStream: replacementStream,
         serverSideEncryption: values[7],
-        sseKmsKeyId: values[8]
+        sseKmsKeyId: values[8],
+        contentEncoding: values[9],
+        tagging: values[10]
       })
     })
   })
 }
 
-function S3Storage (opts) {
+function S3Storage(opts) {
   switch (typeof opts.s3) {
     case 'object': this.s3 = opts.s3; break
     default: throw new TypeError('Expected opts.s3 to be object')
@@ -134,6 +141,20 @@ function S3Storage (opts) {
     default: throw new TypeError('Expected opts.contentDisposition to be undefined, string or function')
   }
 
+  switch (typeof opts.contentEncoding) {
+    case 'function': this.getContentEncoding = opts.contentEncoding; break
+    case 'string': this.getContentEncoding = staticValue(opts.contentEncoding); break
+    case 'undefined': this.getContentEncoding = defaultContentEncoding; break
+    default: throw new TypeError('Expected opts.contentEncoding to be undefined, string or function')
+  }
+
+  switch (typeof opts.tagging) {
+    case 'function': this.getTagging = opts.tagging; break
+    case 'string': this.getTagging = staticValue(opts.tagging); break
+    case 'undefined': this.getTagging = defaultTagging; break
+    default: throw new TypeError('Expected opts.tagging to be undefined, string or function')
+  }
+
   switch (typeof opts.storageClass) {
     case 'function': this.getStorageClass = opts.storageClass; break
     case 'string': this.getStorageClass = staticValue(opts.storageClass); break
@@ -179,15 +200,31 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       params.ContentDisposition = opts.contentDisposition
     }
 
-    var upload = this.s3.upload(params)
+    if (opts.contentEncoding) {
+      params.ContentEncoding = opts.contentEncoding
+    }
 
-    upload.on('httpUploadProgress', function (ev) {
-      if (ev.total) currentSize = ev.total
-    })
+    if (opts.tagging) {
+      params.Tagging = opts.tagging
+    }
 
-    upload.send(function (err, result) {
-      if (err) return cb(err)
+    try {
+      var upload = new Upload({
+        client: this.s3,
+        params: params,
+      })
 
+      upload.on('httpUploadProgress', function (progress) {
+        if (progress.total) {
+          currentSize = progress.total;
+        }
+      });
+    } catch (e) {
+      cb(e);
+      return;
+    }
+    
+    upload.done().then(function (result) {
       cb(null, {
         size: currentSize,
         bucket: opts.bucket,
@@ -195,6 +232,8 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         acl: opts.acl,
         contentType: opts.contentType,
         contentDisposition: opts.contentDisposition,
+        contentEncoding: opts.contentEncoding,
+        tagging: opts.tagging,
         storageClass: opts.storageClass,
         serverSideEncryption: opts.serverSideEncryption,
         metadata: opts.metadata,
@@ -202,8 +241,9 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         etag: result.ETag,
         versionId: result.VersionId
       })
-    })
-  })
+    }, cb);
+
+  });
 }
 
 S3Storage.prototype._removeFile = function (req, file, cb) {
