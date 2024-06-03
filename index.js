@@ -1,9 +1,11 @@
 var crypto = require("crypto");
 var stream = require("stream");
-var FileType = require("file-type");
-var isSvg = require("is-svg");
+var fileType = require("file-type");
+var htmlCommentRegex = require("html-comment-regex");
 var parallel = require("run-parallel");
 var Upload = require("@aws-sdk/lib-storage").Upload;
+var DeleteObjectCommand = require("@aws-sdk/client-s3").DeleteObjectCommand;
+var util = require("util");
 
 function staticValue(value) {
   return function (req, file, cb) {
@@ -14,14 +16,28 @@ function staticValue(value) {
 var defaultAcl = staticValue("private");
 var defaultContentType = staticValue("application/octet-stream");
 
-var defaultMetadata = staticValue(null);
+var defaultMetadata = staticValue(undefined);
 var defaultCacheControl = staticValue(null);
 var defaultContentDisposition = staticValue(null);
 var defaultContentEncoding = staticValue(null);
-var defaultTagging = staticValue(null);
 var defaultStorageClass = staticValue("STANDARD");
 var defaultSSE = staticValue(null);
 var defaultSSEKMS = staticValue(null);
+
+// Regular expression to detect svg file content, inspired by: https://github.com/sindresorhus/is-svg/blob/master/index.js
+// It is not always possible to check for an end tag if a file is very big. The firstChunk, see below, might not be the entire file.
+var svgRegex = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!doctype svg[^>]*>\s*)?<svg[^>]*>/i;
+
+function isSvg(svg) {
+  // Remove DTD entities
+  svg = svg.replace(/\s*<!Entity\s+\S*\s*(?:"|')[^"]+(?:"|')\s*>/gim, "");
+  // Remove DTD markup declarations
+  svg = svg.replace(/\[?(?:\s*<![A-Z]+[^>]*>\s*)*\]?/g, "");
+  // Remove HTML comments
+  svg = svg.replace(htmlCommentRegex, "");
+
+  return svgRegex.test(svg);
+}
 
 function defaultKey(req, file, cb) {
   crypto.randomBytes(16, function (err, raw) {
@@ -30,25 +46,23 @@ function defaultKey(req, file, cb) {
 }
 
 function autoContentType(req, file, cb) {
-  file.stream.once("data", function (firstChunk) {
-    Promise.resolve(FileType.fromBuffer(firstChunk)).then(function (type) {
-      var mime;
+  file.stream.once("data", async function (firstChunk) {
+    var type = await fileType.fileTypeFromBuffer(firstChunk);
+    var mime = "application/octet-stream"; // default type
 
-      if (type) {
-        mime = type.mime;
-      } else if (isSvg(firstChunk)) {
-        mime = "image/svg+xml";
-      } else {
-        mime = "application/octet-stream";
-      }
+    // Make sure to check xml-extension for svg files.
+    if ((!type || type.ext === "xml") && isSvg(firstChunk.toString())) {
+      mime = "image/svg+xml";
+    } else if (type) {
+      mime = type.mime;
+    }
 
-      var outStream = new stream.PassThrough();
+    var outStream = new stream.PassThrough();
 
-      outStream.write(firstChunk);
-      file.stream.pipe(outStream);
+    outStream.write(firstChunk);
+    file.stream.pipe(outStream);
 
-      cb(null, mime, outStream);
-    });
+    cb(null, mime, outStream);
   });
 }
 
@@ -65,7 +79,6 @@ function collect(storage, req, file, cb) {
       storage.getSSE.bind(storage, req, file),
       storage.getSSEKMS.bind(storage, req, file),
       storage.getContentEncoding.bind(storage, req, file),
-      storage.getTagging.bind(storage, req, file),
     ],
     function (err, values) {
       if (err) return cb(err);
@@ -89,7 +102,6 @@ function collect(storage, req, file, cb) {
             serverSideEncryption: values[7],
             sseKmsKeyId: values[8],
             contentEncoding: values[9],
-            tagging: values[10],
           });
         }
       );
@@ -220,22 +232,6 @@ function S3Storage(opts) {
       );
   }
 
-  switch (typeof opts.tagging) {
-    case "function":
-      this.getTagging = opts.tagging;
-      break;
-    case "string":
-      this.getTagging = staticValue(opts.tagging);
-      break;
-    case "undefined":
-      this.getTagging = defaultTagging;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.tagging to be undefined, string or function"
-      );
-  }
-
   switch (typeof opts.storageClass) {
     case "function":
       this.getStorageClass = opts.storageClass;
@@ -312,27 +308,19 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       params.ContentEncoding = opts.contentEncoding;
     }
 
-    if (opts.tagging) {
-      params.Tagging = opts.tagging;
-    }
+    var upload = new Upload({
+      client: this.s3,
+      params: params,
+    });
 
-    try {
-      var upload = new Upload({
-        client: this.s3,
-        params: params,
-      });
+    upload.on("httpUploadProgress", function (ev) {
+      if (ev.total) currentSize = ev.total;
+      else if (ev.loaded) currentSize = ev.loaded;
+    });
 
-      upload.on("httpUploadProgress", function (progress) {
-        if (progress.total) {
-          currentSize = progress.total;
-        }
-      });
-    } catch (e) {
-      cb(e);
-      return;
-    }
+    util.callbackify(upload.done.bind(upload))(function (err, result) {
+      if (err) return cb(err);
 
-    upload.done().then(function (result) {
       cb(null, {
         size: currentSize,
         bucket: opts.bucket,
@@ -341,7 +329,6 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         contentType: opts.contentType,
         contentDisposition: opts.contentDisposition,
         contentEncoding: opts.contentEncoding,
-        tagging: opts.tagging,
         storageClass: opts.storageClass,
         serverSideEncryption: opts.serverSideEncryption,
         metadata: opts.metadata,
@@ -349,12 +336,18 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         etag: result.ETag,
         versionId: result.VersionId,
       });
-    }, cb);
+    });
   });
 };
 
 S3Storage.prototype._removeFile = function (req, file, cb) {
-  this.s3.deleteObject({ Bucket: file.bucket, Key: file.key }, cb);
+  this.s3.send(
+    new DeleteObjectCommand({
+      Bucket: file.bucket,
+      Key: file.key,
+    }),
+    cb
+  );
 };
 
 module.exports = function (opts) {

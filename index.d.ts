@@ -1,8 +1,8 @@
-import { ServiceClients } from "@aws-sdk/lib-storage";
+import { S3Client } from "@aws-sdk/client-s3";
 import { StorageEngine } from "multer";
 
 interface Options {
-  s3: ServiceClients;
+  s3: S3Client;
   bucket:
     | ((
         req: Express.Request,
@@ -21,7 +21,8 @@ interface Options {
         file: Express.Multer.File,
         callback: (error: any, acl?: string) => void
       ) => void)
-    | string;
+    | string
+    | undefined;
   contentType?(
     req: Express.Request,
     file: Express.Multer.File,
@@ -37,7 +38,8 @@ interface Options {
         file: Express.Multer.File,
         callback: (error: any, contentDisposition?: string) => void
       ) => void)
-    | string;
+    | string
+    | undefined;
   metadata?(
     req: Express.Request,
     file: Express.Multer.File,
@@ -49,14 +51,16 @@ interface Options {
         file: Express.Multer.File,
         callback: (error: any, cacheControl?: string) => void
       ) => void)
-    | string;
+    | string
+    | undefined;
   serverSideEncryption?:
     | ((
         req: Express.Request,
         file: Express.Multer.File,
         callback: (error: any, serverSideEncryption?: string) => void
       ) => void)
-    | string;
+    | string
+    | undefined;
 }
 
 declare global {
