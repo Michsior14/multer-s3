@@ -23,6 +23,7 @@ var defaultContentEncoding = staticValue(null);
 var defaultStorageClass = staticValue("STANDARD");
 var defaultSSE = staticValue(null);
 var defaultSSEKMS = staticValue(null);
+var defaultTagging = staticValue(undefined);
 
 // Regular expression to detect svg file content, inspired by: https://github.com/sindresorhus/is-svg/blob/master/index.js
 // It is not always possible to check for an end tag if a file is very big. The firstChunk, see below, might not be the entire file.
@@ -79,6 +80,7 @@ function collect(storage, req, file, cb) {
       storage.getSSE.bind(storage, req, file),
       storage.getSSEKMS.bind(storage, req, file),
       storage.getContentEncoding.bind(storage, req, file),
+      storage.getTagging.bind(storage, req, file),
     ],
     function (err, values) {
       if (err) return cb(err);
@@ -102,6 +104,7 @@ function collect(storage, req, file, cb) {
             serverSideEncryption: values[7],
             sseKmsKeyId: values[8],
             contentEncoding: values[9],
+            tagging: values[10],
           });
         }
       );
@@ -279,6 +282,22 @@ function S3Storage(opts) {
         "Expected opts.sseKmsKeyId to be undefined, string, or function"
       );
   }
+
+  switch (typeof opts.tagging) {
+    case "function":
+      this.getTagging = opts.tagging;
+      break;
+    case "string":
+      this.getTagging = staticValue(opts.tagging);
+      break;
+    case "undefined":
+      this.getTagging = defaultTagging;
+      break;
+    default:
+      throw new TypeError(
+        "Expected opts.tagging to be undefined, string or function"
+      );
+  }
 }
 
 S3Storage.prototype._handleFile = function (req, file, cb) {
@@ -308,6 +327,10 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       params.ContentEncoding = opts.contentEncoding;
     }
 
+    if (opts.tagging) {
+      params.Tagging = opts.tagging;
+    }
+
     var upload = new Upload({
       client: this.s3,
       params: params,
@@ -335,6 +358,7 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         location: result.Location,
         etag: result.ETag,
         versionId: result.VersionId,
+        tagging: opts.tagging,
       });
     });
   });

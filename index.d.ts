@@ -61,6 +61,14 @@ interface Options {
       ) => void)
     | string
     | undefined;
+  tagging?:
+    | ((
+        req: Express.Request,
+        file: Express.Multer.File,
+        callback: (error: any, tagging?: any) => void
+      ) => void)
+    | string
+    | undefined;
 }
 
 declare global {

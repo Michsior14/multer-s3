@@ -1,6 +1,6 @@
 {
   "name": "@michaukrieg/multer-s3",
-  "version": "4.1.1",
+  "version": "4.2.0",
   "description": "Streaming multer storage engine for AWS S3",
   "main": "index.js",
   "types": "index.d.ts",
