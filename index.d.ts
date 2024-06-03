@@ -65,7 +65,7 @@ interface Options {
     | ((
         req: Express.Request,
         file: Express.Multer.File,
-        callback: (error: any, tagging?: any) => void
+        callback: (error: any, tagging?: string) => void
       ) => void)
     | string
     | undefined;
