@@ -1,6 +1,6 @@
 {
   "name": "@michaukrieg/multer-s3",
-  "version": "4.1.0",
+  "version": "4.1.1",
   "description": "Streaming multer storage engine for AWS S3",
   "main": "index.js",
   "types": "index.d.ts",
@@ -24,7 +24,7 @@
   },
   "homepage": "https://github.com/Michsior14/multer-s3#readme",
   "dependencies": {
-    "file-type": "^19.0.0",
+    "file-type": "^16.5.3",
     "html-comment-regex": "^1.1.2",
     "run-parallel": "^1.2.0"
   },
