@@ -1,11 +1,14 @@
 {
   "name": "@michaukrieg/multer-s3",
-  "version": "4.2.1",
+  "version": "5.0.0",
   "description": "Streaming multer storage engine for AWS S3",
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
-    "test": "standard && mocha test/basic.js"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "tsc -p test/types && mocha",
+    "biome:ci": "biome ci ."
   },
   "repository": {
     "type": "git",
@@ -24,23 +27,34 @@
   },
   "homepage": "https://github.com/Michsior14/multer-s3#readme",
   "dependencies": {
-    "file-type": "^16.5.3",
-    "html-comment-regex": "^1.1.2",
-    "run-parallel": "^1.2.0"
+    "file-type": "^22.3.0"
   },
   "devDependencies": {
-    "@aws-sdk/client-s3": "^3.588.0",
-    "@aws-sdk/lib-storage": "^3.588.0",
-    "express": "^4.19.2",
-    "form-data": "^4.0.0",
-    "mocha": "^10.4.0",
-    "multer": "^1.4.5-lts.1",
-    "on-finished": "^2.4.1",
-    "standard": "^17.1.0",
-    "xtend": "^4.0.2"
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/lib-storage": "^3.1169.0",
+    "@biomejs/biome": "2.6.8",
+    "@types/multer": "^2.3.0",
+    "form-data": "^4.0.6",
+    "mocha": "^12.0.3",
+    "multer": "^2.5.0",
+    "on-finished": "^2.4.2",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
     "@aws-sdk/client-s3": "^3.0.0",
-    "@aws-sdk/lib-storage": "^3.0.0"
+    "@aws-sdk/lib-storage": "^3.0.0",
+    "@types/multer": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "peerDependenciesMeta": {
+    "@types/multer": {
+      "optional": true
+    }
   }
 }

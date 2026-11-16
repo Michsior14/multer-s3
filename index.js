@@ -1,312 +1,197 @@
-var crypto = require("crypto");
-var stream = require("stream");
-var fileType = require("file-type");
-var htmlCommentRegex = require("html-comment-regex");
-var parallel = require("run-parallel");
-var Upload = require("@aws-sdk/lib-storage").Upload;
-var DeleteObjectCommand = require("@aws-sdk/client-s3").DeleteObjectCommand;
-var util = require("util");
+const crypto = require('node:crypto')
+const stream = require('node:stream')
+const util = require('node:util')
+const { Upload } = require('@aws-sdk/lib-storage')
+const { DeleteObjectCommand } = require('@aws-sdk/client-s3')
+
+const DEFAULT_MIME = 'application/octet-stream'
+// Number of bytes collected before the content type is detected (file-type's recommended sample size)
+const SAMPLE_SIZE = 4100
+// Upper bound of the bytes handed to file-type
+const MAX_DETECTION_SIZE = 64 * 1024
 
 function staticValue(value) {
-  return function (req, file, cb) {
-    cb(null, value);
-  };
+  return (req, file, cb) => {
+    cb(null, value)
+  }
 }
 
-var defaultAcl = staticValue("private");
-var defaultContentType = staticValue("application/octet-stream");
-
-var defaultMetadata = staticValue(undefined);
-var defaultCacheControl = staticValue(null);
-var defaultContentDisposition = staticValue(null);
-var defaultContentEncoding = staticValue(null);
-var defaultStorageClass = staticValue("STANDARD");
-var defaultSSE = staticValue(null);
-var defaultSSEKMS = staticValue(null);
-var defaultTagging = staticValue(undefined);
-
-// Regular expression to detect svg file content, inspired by: https://github.com/sindresorhus/is-svg/blob/master/index.js
-// It is not always possible to check for an end tag if a file is very big. The firstChunk, see below, might not be the entire file.
-var svgRegex = /^\s*(?:<\?xml[^>]*>\s*)?(?:<!doctype svg[^>]*>\s*)?<svg[^>]*>/i;
-
-function isSvg(svg) {
-  // Remove DTD entities
-  svg = svg.replace(/\s*<!Entity\s+\S*\s*(?:"|')[^"]+(?:"|')\s*>/gim, "");
-  // Remove DTD markup declarations
-  svg = svg.replace(/\[?(?:\s*<![A-Z]+[^>]*>\s*)*\]?/g, "");
-  // Remove HTML comments
-  svg = svg.replace(htmlCommentRegex, "");
-
-  return svgRegex.test(svg);
-}
+const defaultAcl = staticValue('private')
+const defaultContentType = staticValue(DEFAULT_MIME)
+const defaultStorageClass = staticValue('STANDARD')
 
 function defaultKey(req, file, cb) {
-  crypto.randomBytes(16, function (err, raw) {
-    cb(err, err ? undefined : raw.toString("hex"));
-  });
+  crypto.randomBytes(16, (err, raw) => {
+    cb(err, err ? undefined : raw.toString('hex'))
+  })
+}
+
+const importFileType = () => import('file-type')
+let fileTypeLoader = importFileType
+let fileTypePromise
+
+function loadFileType() {
+  // file-type is ESM only, so it has to be imported dynamically
+  if (!fileTypePromise) {
+    fileTypePromise = Promise.resolve()
+      .then(fileTypeLoader)
+      .catch((err) => {
+        fileTypePromise = undefined
+        const error = new Error(
+          'Failed to load file-type, required by AUTO_CONTENT_TYPE (when using Jest, run it with --experimental-vm-modules): ' +
+            err.message
+        )
+        error.cause = err
+        throw error
+      })
+  }
+  return fileTypePromise
+}
+
+// Never rejects: any detection failure results in the default mime type
+async function detectMime(fileType, buffered) {
+  try {
+    const type = await fileType.fileTypeFromBuffer(buffered.subarray(0, MAX_DETECTION_SIZE))
+    return type ? type.mime : DEFAULT_MIME
+  } catch (_err) {
+    return DEFAULT_MIME
+  }
 }
 
 function autoContentType(req, file, cb) {
-  file.stream.once("data", async function (firstChunk) {
-    var type = await fileType.fromBuffer(firstChunk);
-    var mime = "application/octet-stream"; // default type
+  const source = file.stream
+  const chunks = []
+  let length = 0
+  let detecting = false
+  let sourceError
+  let outStream
 
-    // Make sure to check xml-extension for svg files.
-    if ((!type || type.ext === "xml") && isSvg(firstChunk.toString())) {
-      mime = "image/svg+xml";
-    } else if (type) {
-      mime = type.mime;
+  function onData(chunk) {
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+    chunks.push(buffer)
+    length += buffer.length
+    // Stop reading until the replacement stream is attached, so no data is lost
+    if (length >= SAMPLE_SIZE) detect(false)
+  }
+
+  function detect(ended) {
+    detecting = true
+    source.pause()
+    source.removeListener('data', onData)
+    const buffered = Buffer.concat(chunks, length)
+    chunks.length = 0
+
+    // detectMime never rejects, so only a failure to load file-type ends up in the error handler
+    loadFileType()
+      .then((fileType) => detectMime(fileType, buffered))
+      .then(
+        (mime) => process.nextTick(done, null, mime),
+        (err) => process.nextTick(done, err)
+      )
+
+    function done(err, mime) {
+      if (err || sourceError) {
+        // Drain the file, so the parser is not left blocked
+        source.resume()
+        return cb(err || sourceError)
+      }
+
+      // The listener is needed because the stream is not read until the upload starts,
+      // the error itself still reaches the reader
+      outStream = new stream.PassThrough().on('error', () => {})
+      outStream.write(buffered)
+      if (ended) outStream.end()
+      else source.pipe(outStream)
+
+      cb(null, mime, outStream)
     }
+  }
 
-    var outStream = new stream.PassThrough();
+  // Also reports a stream that was closed before (e.g. while the other options were resolved),
+  // and keeps an error listener on the source for as long as it is used
+  stream.finished(source, (err) => {
+    if (outStream) {
+      // pipe() doesn't forward errors or premature closes
+      if (err) outStream.destroy(err)
+    } else if (detecting) {
+      sourceError = err
+    } else {
+      source.removeListener('data', onData)
+      if (err) cb(err)
+      else detect(true)
+    }
+  })
 
-    outStream.write(firstChunk);
-    file.stream.pipe(outStream);
-
-    cb(null, mime, outStream);
-  });
+  source.on('data', onData)
 }
 
+// [option, property of the storage, accepts a static string, default]
+const OPTIONS = [
+  ['bucket', 'getBucket', true],
+  ['key', 'getKey', false, defaultKey],
+  ['acl', 'getAcl', true, defaultAcl],
+  ['metadata', 'getMetadata', false, staticValue(undefined)],
+  ['cacheControl', 'getCacheControl', true, staticValue(null)],
+  ['contentDisposition', 'getContentDisposition', true, staticValue(null)],
+  ['contentEncoding', 'getContentEncoding', true, staticValue(null)],
+  ['storageClass', 'getStorageClass', true, defaultStorageClass],
+  ['serverSideEncryption', 'getSSE', true, staticValue(null)],
+  ['sseKmsKeyId', 'getSSEKMS', true, staticValue(null)],
+  ['tagging', 'getTagging', true, staticValue(undefined)]
+]
+
 function collect(storage, req, file, cb) {
-  parallel(
-    [
-      storage.getBucket.bind(storage, req, file),
-      storage.getKey.bind(storage, req, file),
-      storage.getAcl.bind(storage, req, file),
-      storage.getMetadata.bind(storage, req, file),
-      storage.getCacheControl.bind(storage, req, file),
-      storage.getContentDisposition.bind(storage, req, file),
-      storage.getStorageClass.bind(storage, req, file),
-      storage.getSSE.bind(storage, req, file),
-      storage.getSSEKMS.bind(storage, req, file),
-      storage.getContentEncoding.bind(storage, req, file),
-      storage.getTagging.bind(storage, req, file),
-    ],
-    function (err, values) {
-      if (err) return cb(err);
+  Promise.all(OPTIONS.map(([, property]) => util.promisify(storage[property]).call(storage, req, file)))
+    .then((values) => {
+      const opts = Object.fromEntries(OPTIONS.map(([name], index) => [name, values[index]]))
 
-      storage.getContentType(
-        req,
-        file,
-        function (err, contentType, replacementStream) {
-          if (err) return cb(err);
+      return new Promise((resolve, reject) => {
+        storage.getContentType(req, file, (err, contentType, replacementStream) => {
+          if (err) reject(err)
+          else resolve({ ...opts, contentType, replacementStream })
+        })
+      })
+    })
+    .then(
+      (opts) => process.nextTick(cb, null, opts),
+      (err) => process.nextTick(cb, err)
+    )
+}
 
-          cb.call(storage, null, {
-            bucket: values[0],
-            key: values[1],
-            acl: values[2],
-            metadata: values[3],
-            cacheControl: values[4],
-            contentDisposition: values[5],
-            storageClass: values[6],
-            contentType: contentType,
-            replacementStream: replacementStream,
-            serverSideEncryption: values[7],
-            sseKmsKeyId: values[8],
-            contentEncoding: values[9],
-            tagging: values[10],
-          });
-        }
-      );
-    }
-  );
+// Resolves an option that can be a function, optionally a static string, or a default
+function getter(opts, name, string, fallback) {
+  const value = opts[name]
+
+  if (typeof value === 'function') return value
+  if (string && typeof value === 'string') return staticValue(value)
+  if (typeof value === 'undefined') return fallback
+
+  throw new TypeError(
+    `Expected opts.${name} to be ${string ? 'undefined, string or function' : 'undefined or function'}`
+  )
 }
 
 function S3Storage(opts) {
-  switch (typeof opts.s3) {
-    case "object":
-      this.s3 = opts.s3;
-      break;
-    default:
-      throw new TypeError("Expected opts.s3 to be object");
+  if (typeof opts.s3 !== 'object' || opts.s3 === null) {
+    throw new TypeError('Expected opts.s3 to be object')
   }
+  this.s3 = opts.s3
 
-  switch (typeof opts.bucket) {
-    case "function":
-      this.getBucket = opts.bucket;
-      break;
-    case "string":
-      this.getBucket = staticValue(opts.bucket);
-      break;
-    case "undefined":
-      throw new Error("bucket is required");
-    default:
-      throw new TypeError(
-        "Expected opts.bucket to be undefined, string or function"
-      );
-  }
+  if (typeof opts.bucket === 'undefined') throw new Error('bucket is required')
 
-  switch (typeof opts.key) {
-    case "function":
-      this.getKey = opts.key;
-      break;
-    case "undefined":
-      this.getKey = defaultKey;
-      break;
-    default:
-      throw new TypeError("Expected opts.key to be undefined or function");
+  for (const [name, property, string, fallback] of OPTIONS) {
+    this[property] = getter(opts, name, string, fallback)
   }
-
-  switch (typeof opts.acl) {
-    case "function":
-      this.getAcl = opts.acl;
-      break;
-    case "string":
-      this.getAcl = staticValue(opts.acl);
-      break;
-    case "undefined":
-      this.getAcl = defaultAcl;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.acl to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.contentType) {
-    case "function":
-      this.getContentType = opts.contentType;
-      break;
-    case "undefined":
-      this.getContentType = defaultContentType;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.contentType to be undefined or function"
-      );
-  }
-
-  switch (typeof opts.metadata) {
-    case "function":
-      this.getMetadata = opts.metadata;
-      break;
-    case "undefined":
-      this.getMetadata = defaultMetadata;
-      break;
-    default:
-      throw new TypeError("Expected opts.metadata to be undefined or function");
-  }
-
-  switch (typeof opts.cacheControl) {
-    case "function":
-      this.getCacheControl = opts.cacheControl;
-      break;
-    case "string":
-      this.getCacheControl = staticValue(opts.cacheControl);
-      break;
-    case "undefined":
-      this.getCacheControl = defaultCacheControl;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.cacheControl to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.contentDisposition) {
-    case "function":
-      this.getContentDisposition = opts.contentDisposition;
-      break;
-    case "string":
-      this.getContentDisposition = staticValue(opts.contentDisposition);
-      break;
-    case "undefined":
-      this.getContentDisposition = defaultContentDisposition;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.contentDisposition to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.contentEncoding) {
-    case "function":
-      this.getContentEncoding = opts.contentEncoding;
-      break;
-    case "string":
-      this.getContentEncoding = staticValue(opts.contentEncoding);
-      break;
-    case "undefined":
-      this.getContentEncoding = defaultContentEncoding;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.contentEncoding to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.storageClass) {
-    case "function":
-      this.getStorageClass = opts.storageClass;
-      break;
-    case "string":
-      this.getStorageClass = staticValue(opts.storageClass);
-      break;
-    case "undefined":
-      this.getStorageClass = defaultStorageClass;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.storageClass to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.serverSideEncryption) {
-    case "function":
-      this.getSSE = opts.serverSideEncryption;
-      break;
-    case "string":
-      this.getSSE = staticValue(opts.serverSideEncryption);
-      break;
-    case "undefined":
-      this.getSSE = defaultSSE;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.serverSideEncryption to be undefined, string or function"
-      );
-  }
-
-  switch (typeof opts.sseKmsKeyId) {
-    case "function":
-      this.getSSEKMS = opts.sseKmsKeyId;
-      break;
-    case "string":
-      this.getSSEKMS = staticValue(opts.sseKmsKeyId);
-      break;
-    case "undefined":
-      this.getSSEKMS = defaultSSEKMS;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.sseKmsKeyId to be undefined, string, or function"
-      );
-  }
-
-  switch (typeof opts.tagging) {
-    case "function":
-      this.getTagging = opts.tagging;
-      break;
-    case "string":
-      this.getTagging = staticValue(opts.tagging);
-      break;
-    case "undefined":
-      this.getTagging = defaultTagging;
-      break;
-    default:
-      throw new TypeError(
-        "Expected opts.tagging to be undefined, string or function"
-      );
-  }
+  this.getContentType = getter(opts, 'contentType', false, defaultContentType)
 }
 
 S3Storage.prototype._handleFile = function (req, file, cb) {
-  collect(this, req, file, function (err, opts) {
-    if (err) return cb(err);
+  collect(this, req, file, (err, opts) => {
+    if (err) return cb(err)
 
-    var currentSize = 0;
+    let currentSize = 0
 
-    var params = {
+    const params = {
       Bucket: opts.bucket,
       Key: opts.key,
       ACL: opts.acl,
@@ -316,33 +201,40 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
       StorageClass: opts.storageClass,
       ServerSideEncryption: opts.serverSideEncryption,
       SSEKMSKeyId: opts.sseKmsKeyId,
-      Body: opts.replacementStream || file.stream,
-    };
+      Body: opts.replacementStream || file.stream
+    }
 
     if (opts.contentDisposition) {
-      params.ContentDisposition = opts.contentDisposition;
+      params.ContentDisposition = opts.contentDisposition
     }
 
     if (opts.contentEncoding) {
-      params.ContentEncoding = opts.contentEncoding;
+      params.ContentEncoding = opts.contentEncoding
     }
 
     if (opts.tagging) {
-      params.Tagging = opts.tagging;
+      params.Tagging = opts.tagging
     }
 
-    var upload = new Upload({
+    const upload = new Upload({
       client: this.s3,
-      params: params,
-    });
+      params
+    })
 
-    upload.on("httpUploadProgress", function (ev) {
-      if (ev.total) currentSize = ev.total;
-      else if (ev.loaded) currentSize = ev.loaded;
-    });
+    upload.on('httpUploadProgress', (ev) => {
+      currentSize = ev.total || ev.loaded || currentSize
+    })
 
-    util.callbackify(upload.done.bind(upload))(function (err, result) {
-      if (err) return cb(err);
+    util.callbackify(upload.done.bind(upload))((err, result) => {
+      if (err) {
+        // Don't leave the source blocked on a stream nobody reads anymore
+        if (opts.replacementStream) {
+          // web streams have no destroy()
+          opts.replacementStream.destroy?.()
+          file.stream.resume()
+        }
+        return cb(err)
+      }
 
       cb(null, {
         size: currentSize,
@@ -358,25 +250,23 @@ S3Storage.prototype._handleFile = function (req, file, cb) {
         location: result.Location,
         etag: result.ETag,
         versionId: result.VersionId,
-        tagging: opts.tagging,
-      });
-    });
-  });
-};
+        tagging: opts.tagging
+      })
+    })
+  })
+}
 
 S3Storage.prototype._removeFile = function (req, file, cb) {
-  this.s3.send(
-    new DeleteObjectCommand({
-      Bucket: file.bucket,
-      Key: file.key,
-    }),
-    cb
-  );
-};
+  util.callbackify(() => this.s3.send(new DeleteObjectCommand({ Bucket: file.bucket, Key: file.key })))(cb)
+}
 
-module.exports = function (opts) {
-  return new S3Storage(opts);
-};
+module.exports = (opts) => new S3Storage(opts)
 
-module.exports.AUTO_CONTENT_TYPE = autoContentType;
-module.exports.DEFAULT_CONTENT_TYPE = defaultContentType;
+module.exports.AUTO_CONTENT_TYPE = autoContentType
+module.exports.DEFAULT_CONTENT_TYPE = defaultContentType
+
+// Test hook: replaces how file-type is loaded, call without arguments to restore the default
+module.exports._setFileTypeLoader = (loader) => {
+  fileTypeLoader = loader || importFileType
+  fileTypePromise = undefined
+}
