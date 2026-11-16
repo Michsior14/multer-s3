@@ -250,6 +250,19 @@ The optional `contentEncoding` option (string or function) sets the `Content-Enc
 
 The optional `tagging` option (string or function) sets the object tags, in URL query format, e.g. `'key1=value1&key2=value2'`.
 
+## Releasing
+
+Versions are calculated from [Conventional Commits](https://www.conventionalcommits.org/):
+
+| Commit                                                                       | Release    |
+| ---------------------------------------------------------------------------- | ---------- |
+| `fix: ...`, `perf: ...`                                                      | patch      |
+| `feat: ...`                                                                  | minor      |
+| `feat!: ...`, `fix!: ...` (any type with `!`) or a `BREAKING CHANGE:` footer | major      |
+| `docs:`, `chore:`, `ci:`, `test:`, `build:`, `refactor:`, `release:` ...     | no release |
+
+To release, run the **Release** workflow from the Actions tab on `main`. It runs the checks, calculates the version, updates `CHANGELOG.md` and `package.json` (committed as `release: x.y.z`), publishes to npm using [trusted publishing](https://docs.npmjs.com/trusted-publishers) and creates the GitHub release. Tick _dry-run_ to only see what would be released.
+
 ## Testing
 
 The tests mock all access to S3 and can be run completely offline.
